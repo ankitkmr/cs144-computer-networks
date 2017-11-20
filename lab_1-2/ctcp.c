@@ -46,8 +46,7 @@ struct ctcp_state {
 	int last_ack_sent;
 	int last_ack_received;
 
-	pthread_mutex_t output_thread_mutex;	/* to synchronise access to io_thread 
-											   and its state fields */
+	pthread_mutex_t output_thread_mutex;	/* to synchronise access to io_thread and its state fields */
 
 	pthread_t output_thread;
 	short is_output_thread_running;
@@ -116,27 +115,19 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
 	pthread_mutex_init(&(state->inflight_list_lock), NULL);		
 	pthread_mutex_init(&(state->received_list_lock), NULL);
 
-	/* because it's said that ctcp_timer maybe called before ctcp_init i.e. independently
-	   so important to hold mutextes in init as well, also good programming practice - consistency*/
-	pthread_mutex_lock(&output_thread_mutex);
 	state->is_output_thread_running = 0u;
-	pthread_mutex_unlock(&output_thread_mutex);
-
 
 	/*Initializing outbound, inflight and received segments with an empty linked list*/
-	pthread_mutex_lock(&(state->outbound_segments_list));
 	state->outbound_segments_list = ll_create();
-	pthread_mutex_unlock(&(state->outbound_segments_list));
-
-	pthread_mutex_lock(&(state->inflight_segments_list));
 	state->inflight_segments_list = ll_create();		
-	pthread_mutex_unlock(&(state->inflight_segments_list));
-
-	pthread_mutex_lock(&(state->received_segments_list));
 	state->received_segments_list = ll_create();
-	pthread_mutex_unlock(&(state->received_segments_list));
 
 
+	/* now add the state to the state_list*/
+	if(state_list == NULL){
+		state_list = ll_create();
+	}
+	ll_add(state_list, state);
 	return state;
 }
 
@@ -231,8 +222,9 @@ ctcp_segment_t *create_new_fin_segment(ctcp_state_t *state){
 
 /* this function is called by child thread forked by ctcp_read. It's job is to 
    send out the segments while maintaining window size */
-void send_outbound_tail_segments(ctcp_state_t *state){
+void send_outbound_tail_segments(void *state){
 
+	ctcp_state_t ctcp_state = (ctcp_state_t *)state;
 	short send_window_size = state->config->send_window;
 	timestamped_segment_t *tail_timestamped_segment;
 
@@ -279,7 +271,6 @@ void send_outbound_tail_segments(ctcp_state_t *state){
  * REMEMBER: 
  * In this function, Memory allocated for: segments and timestamped segments and is
  * to be freed when sent and acked by other end
- *
  */
 void ctcp_read(ctcp_state_t *state) {
 
