@@ -158,68 +158,51 @@ void array_copy(char *to, char *from, int n){
 }
 
 
-/* Helper Function to create a new segment with data. Returns a pointer to the new segment */
-ctcp_segment_t *create_new_data_segment(ctcp_state_t *state, int bytes_read, char *buffer){
+/* Helper Function to create a new segment. Returns a pointer to the new segment */
+ctcp_segment_t *create_new_segment(ctcp_state_t *state, int bytes_read, char *buffer){
 
 	/* allocate a new segment */
 	ctcp_segment_t *new_segment = calloc(sizeof(ctcp_segment_t),1);
-
-	/* size of data we send in segment will only be equal to the number of
-	 bytes we have read and hence have to send */		
-	char *data = malloc(bytes_read);
-	array_copy(data, buffer, bytes_read);	
-
 	new_segment->seqno = htonl(state->next_seq_no);
-	state->next_seq_no += bytes_read;
 
 	/* We are handling acks separately so whenever we ack we update this 
 	  field in ctcp_state and while sending in a segment with data, 
 	  we simply copy the current value of last_ack_sent from ctcp_state */
-	new_segment->ackno = htonl(state->last_ack_sent); 
+	new_segment->ackno = htonl(state->last_ack_sent);
 
-	new_segment->len = htons(sizeof(ctcp_segment_t)+bytes_read);
 	new_segment->flags |= htonl(ACK);
 	new_segment->window = htons(state->config->recv_window); 	
+	new_segment->cksum = 0u;
 
-	new_segment->cksum = 0;
-	new_segment->data = data;
+
+	if (bytes_read>0){
+		/*create a new data segment. Also the size of data we send in 
+		segment will only be equal to the number of bytes we have read 
+		and hence have to send */		
+		char *data = malloc(bytes_read);
+		array_copy(data, buffer, bytes_read);
+
+		state->next_seq_no += bytes_read;
+		new_segment->len = htons(sizeof(ctcp_segment_t)+bytes_read);
+		new_segment->data = data;
+	}
+	else if(bytes_read == -1){
+		/*create a fin segment*/
+		state->next_seq_no += 1;	/*for sending ack to a fin we'll receive*/
+		new_segment->len = htons(sizeof(ctcp_segment_t));
+		new_fin_segment->flags |= htonl(FIN); 	/* both a FIN segment as well an ACK segment */
+
+
+	}
+	else{
+		fprintf(stderr, "Unintended Call to create_new_segment\n", );
+	}	
 
 	/* already returns in network byte order */
 	new_segment->cksum = cksum(new_segment,ntohs(new_segment->len));	
-
 	return new_segment;
 }
 
-
-/* Helper Function to create a new fin segment. Returns a pointer to the new segment */
-ctcp_segment_t *create_new_fin_segment(ctcp_state_t *state){
-
-	/* allocate a new segment */
-	ctcp_segment_t *new_fin_segment = calloc(sizeof(ctcp_segment_t),1);	
-
-	new_fin_segment->seqno = htonl(state->next_seq_no);
-	/* no need to update next_seq_no field now as we dont intend to 
-	   send any more segments*/
-
-	/* We are handling acks separately so whenever we ack we update this 
-	  field in ctcp_state and while sending in a segment with data, 
-	  we simply copy the current value of last_ack_sent from ctcp_state */
-	new_fin_segment->ackno = htonl(state->last_ack_sent); 
-
-	new_fin_segment->len = htons(sizeof(ctcp_segment_t));
-
-	/* both a FIN segment as well an ACK segment */
-	new_fin_segment->flags |= htonl(ACK);
-	new_fin_segment->flags |= htonl(FIN);
-
-	new_fin_segment->window = htons(state->config->recv_window); 	
-	new_fin_segment->cksum = 0u;	
-	
-	/* already returns in network byte order */
-	new_fin_segment->cksum = cksum(new_fin_segment,ntohs(new_fin_segment->len));	
-
-	return new_fin_segment;
-}
 
 
 /* this function is called by child thread forked by ctcp_read. It's job is to 
@@ -292,7 +275,7 @@ void ctcp_read(ctcp_state_t *state) {
 	
 	while ((bytes_read = conn_input(state->conn, buffer, MAX_SEG_DATA_SIZE)) > 0){
 		/* encapsulate the data we read into a ctcp segment and add it to head of outbound segment list*/
-		new_segment = create_new_data_segment(state, bytes_read, buffer);
+		new_segment = create_new_segment(state, bytes_read, buffer);
 
 		timestamped_segment = calloc(sizeof(timestamped_segment_t),1);
 		timestamped_segment->segment = new_segment;
@@ -333,7 +316,7 @@ void ctcp_read(ctcp_state_t *state) {
 	/* if encountered EOF or error, terminate the connection */
 	if (bytes_read == -1){	
 		timestamped_segment = calloc(sizeof(timestamped_segment_t),1);
-		timestamped_segment->segment = create_new_fin_segment(state);
+		timestamped_segment->segment = create_new_segment(state, bytes_read, NULL);
 		pthread_mutex_lock(&(state->outbound_list_lock));
 		ll_add_front(state->outbound_segments_list,timestamped_segment);
 		pthread_mutex_unlock(&(state->outbound_list_lock));
