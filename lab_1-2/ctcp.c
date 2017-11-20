@@ -117,17 +117,17 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
 
 
 void ctcp_destroy(ctcp_state_t *state) {
-  /* Update linked list. */
-  if (state->next)
-    state->next->prev = state->prev;
+	/* Update linked list. */
+	if (state->next)
+	state->next->prev = state->prev;
 
-  *state->prev = state->next;
-  conn_remove(state->conn);
+	*state->prev = state->next;
+	conn_remove(state->conn);
 
-  /* FIXME: Do any other cleanup here. */
+	/* FIXME: Do any other cleanup here. */
 
-  free(state);
-  end_client();
+	free(state);
+	end_client();
 }
 
 
@@ -162,10 +162,10 @@ ctcp_segment_t *create_new_data_segment(ctcp_state_t *state, int bytes_read, cha
 	new_segment->len = htons(sizeof(ctcp_segment_t)+bytes_read);
 	new_segment->flags |= htonl(ACK);
 	new_segment->window = htons(WINDOW_SIZE * MAX_SEG_DATA_SIZE); 	
-	
+
 	new_segment->cksum = 0;
 	new_segment->data = data;
-	
+
 	/* already returns in network byte order */
 	new_segment->cksum = cksum(new_segment,ntohs(new_segment->len));	
 
