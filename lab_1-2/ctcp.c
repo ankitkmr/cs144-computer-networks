@@ -46,8 +46,15 @@ struct ctcp_state {
 	int last_ack_sent;
 	int last_ack_received;
 
+	pthread_mutex_t output_thread_mutex;	/* to synchronise access to io_thread 
+											   and its state fields */
 
-	/* locks to synchronise access to shared linked list between threads */
+	pthread_t output_thread;
+	short is_output_thread_running;
+
+	/* locks to synchronise access to shared linked list between threads. 
+	   Need separate locks because the lists they protect are used in 
+	   separate cases and access to them are critical to performance */
 	pthread_mutex_t outbound_list_lock;	
 	pthread_mutex_t received_list_lock;
 	pthread_mutex_t inflight_list_lock;
@@ -101,15 +108,34 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
 	state->last_ack_received = 0u;
 	state->bytes_inflight = 0u;
 
-	/*Initializing outbound, inflight and received segments with an empty linked list*/
-	state->outbound_segments_list = ll_create();
-	state->inflight_segments_list = ll_create();		
-	state->received_segments_list = ll_create();
-
+	
 	/* Initialise mutex locks */
+	pthread_mutex_init(&output_thread_mutex, NULL);
+
 	pthread_mutex_init(&(state->outbound_list_lock), NULL);
 	pthread_mutex_init(&(state->inflight_list_lock), NULL);		
 	pthread_mutex_init(&(state->received_list_lock), NULL);
+
+	/* because it's said that ctcp_timer maybe called before ctcp_init i.e. independently
+	   so important to hold mutextes in init as well, also good programming practice - consistency*/
+	pthread_mutex_lock(&output_thread_mutex);
+	state->is_output_thread_running = 0u;
+	pthread_mutex_unlock(&output_thread_mutex);
+
+
+	/*Initializing outbound, inflight and received segments with an empty linked list*/
+	pthread_mutex_lock(&(state->outbound_segments_list));
+	state->outbound_segments_list = ll_create();
+	pthread_mutex_unlock(&(state->outbound_segments_list));
+
+	pthread_mutex_lock(&(state->inflight_segments_list));
+	state->inflight_segments_list = ll_create();		
+	pthread_mutex_unlock(&(state->inflight_segments_list));
+
+	pthread_mutex_lock(&(state->received_segments_list));
+	state->received_segments_list = ll_create();
+	pthread_mutex_unlock(&(state->received_segments_list));
+
 
 	return state;
 }
@@ -264,11 +290,9 @@ void ctcp_read(ctcp_state_t *state) {
 	/*Our main buffer into which we read in data (upto MAX_SEG_DATA_SIZE bytes at a time)
 	  We then copy the data read from the buffer to an exact size array before adding it to segment*/
 	char* buffer = malloc(MAX_SEG_DATA_SIZE);
-	int have_we_forked = 0;		/* have we forked yet*/
-	int am_i_parent = 1;		/* is the current thread the parent thread, start with non-zero value;
-							   will contain fork return value after fork so non-zero for parent, zero for child*/
-
-	while (am_i_parent>0 && (bytes_read = conn_input(state->conn, buffer, MAX_SEG_DATA_SIZE)) > 0){
+	short need_to_fork_thread=1u;
+	
+	while ((bytes_read = conn_input(state->conn, buffer, MAX_SEG_DATA_SIZE)) > 0){
 		/* encapsulate the data we read into a ctcp segment and add it to head of outbound segment list*/
 		new_segment = create_new_data_segment(state, bytes_read, buffer);
 
@@ -281,32 +305,40 @@ void ctcp_read(ctcp_state_t *state) {
 		ll_add_front(state->outbound_segments_list, timestamped_segment);
 		pthread_mutex_unlock(&(state->outbound_list_lock));
 
-		if (!have_we_forked){
+		if (need_to_fork_thread){
 			/* fork a child thread to simultaneously start sending the segments
 			   and maintain window size while the parent thread continues to 
-			   generate more segments */
-			am_i_parent = fork();	/* returns positive child_pid to parent and 0 to child */
-			if (am_i_parent>=0){	/*successful fork*/
-				have_we_forked=1;
+			   generate more segments 
+
+			   See if output thread is already running from earlier call, or if we
+			   need to fork new thread and update thread status accordingly 
+			*/
+			pthread_mutex_lock(&output_thread_mutex);
+
+			if (!state->is_output_thread_running){
+				need_to_fork_thread = 
+					pthread_create(&(state->output_thread), NULL, 
+										send_outbound_tail_segments, (void *)state);
+				if(!need_to_fork_thread){
+					state->is_output_thread_running=1u;
+				}
 			}
 			else{
-				am_i_parent=1;	/* reset and try again */
+				/* io has more latency than computing, so it may take longer for output
+				    thread to send segments and in that time the library may call ctcp_read again */
+				need_to_fork_thread = 0u;
 			}
+			pthread_mutex_unlock(&output_thread_mutex);
 		}
 	}
 
-	if(!am_i_parent){
-		send_outbound_tail_segments(state);
-	}
-	else{ 
-		/* if encountered EOF or error, terminate the connection */
-		if (bytes_read == -1){	
-			timestamped_segment = calloc(sizeof(timestamped_segment_t),1);
-			timestamped_segment->segment = create_new_fin_segment(state);
-			pthread_mutex_lock(&(state->outbound_list_lock));
-			ll_add_front(state->outbound_segments_list,timestamped_segment);
-			pthread_mutex_unlock(&(state->outbound_list_lock));
-		}
+	/* if encountered EOF or error, terminate the connection */
+	if (bytes_read == -1){	
+		timestamped_segment = calloc(sizeof(timestamped_segment_t),1);
+		timestamped_segment->segment = create_new_fin_segment(state);
+		pthread_mutex_lock(&(state->outbound_list_lock));
+		ll_add_front(state->outbound_segments_list,timestamped_segment);
+		pthread_mutex_unlock(&(state->outbound_list_lock));
 	}
 }
 
