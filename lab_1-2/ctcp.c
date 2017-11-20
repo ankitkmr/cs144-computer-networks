@@ -318,7 +318,7 @@ void ctcp_read(ctcp_state_t *state) {
 			if (!state->is_output_thread_running){
 				need_to_fork_thread = 
 					pthread_create(&(state->output_thread), NULL, 
-										send_outbound_tail_segments, (void *)state);
+							send_outbound_tail_segments, (void *)state);
 				if(!need_to_fork_thread){
 					state->is_output_thread_running=1u;
 				}
