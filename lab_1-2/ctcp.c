@@ -20,7 +20,6 @@
 
 
 #define INITIAL_SEQ_NO 1u /* We'll start with sequence no. 1 */
-#define WINDOW_SIZE 1u	 /* Stop and wait, n=1 */
 
 
 /**
@@ -161,7 +160,7 @@ ctcp_segment_t *create_new_data_segment(ctcp_state_t *state, int bytes_read, cha
 
 	new_segment->len = htons(sizeof(ctcp_segment_t)+bytes_read);
 	new_segment->flags |= htonl(ACK);
-	new_segment->window = htons(WINDOW_SIZE * MAX_SEG_DATA_SIZE); 	
+	new_segment->window = htons(state->config->recv_window); 	
 
 	new_segment->cksum = 0;
 	new_segment->data = data;
@@ -194,7 +193,7 @@ ctcp_segment_t *create_new_fin_segment(ctcp_state_t *state){
 	new_fin_segment->flags |= htonl(ACK);
 	new_fin_segment->flags |= htonl(FIN);
 
-	new_fin_segment->window = htons(WINDOW_SIZE * MAX_SEG_DATA_SIZE); 	
+	new_fin_segment->window = htons(state->config->recv_window); 	
 	new_fin_segment->cksum = 0u;	
 	
 	/* already returns in network byte order */
@@ -209,11 +208,31 @@ ctcp_segment_t *create_new_fin_segment(ctcp_state_t *state){
 void send_outbound_tail_segments(ctcp_state_t *state){
 
 	short send_window_size = state->config->send_window;
+	timestamped_segment_t *tail_timestamped_segment;
+
 	if(send_window_size >  state->bytes_inflight){
-		/* can send more packets */
+		/* can send more packets so remove the last node from outbound and add to
+		   inflight list and then send it*/
+
+		pthread_mutex_lock(&(state->outbound_list_lock));
+
+		if(state->outbound_segments_list->head != NULL){
+			tail_timestamped_segment = state->outbound_segments_list->tail->object;
+			ll_remove(state->outbound_segments_list, state->outbound_segments_list->tail);
+		} 
+		else {
+			/*no segments to send, kill the forked thread*/
+			thread_exit(0);
+		}
+
+		pthread_mutex_unlock(&(state->outbound_list_lock));
+
+
+		pthread_mutex_lock(&(state->inflight_list_lock));
+		pthread_mutex_unlock(&(state->inflight_list_lock));
+
 
 	}
-	pthread_mutex_lock(&(state->outbound_list_lock));
 	/* In stop and wait, we send a segment and then wait for it's ack. 
 	   While we're waiting, we keep the last sent segment, in case we need to retransmit it*/
 	if(state->last_ack_received > 
@@ -230,6 +249,11 @@ void send_outbound_tail_segments(ctcp_state_t *state){
  *
  * On adding each new segment, we check if a new segment from the tail of the 
  * outbound_segments_list in the connection state can be sent and then send it
+ *
+ * REMEMBER: 
+ * In this function, Memory allocated for: segments and timestamped segments and is
+ * to be freed when sent and acked by other end
+ *
  */
 void ctcp_read(ctcp_state_t *state) {
 
