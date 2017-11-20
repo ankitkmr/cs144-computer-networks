@@ -73,7 +73,7 @@ struct ctcp_state {
    and put this in ctcp_state outbound lists along with the time 
    when we send the segment
  */
-typdef struct {
+typedef struct {
 	long time_when_sent;
 	ctcp_segment_t *segment;
 } timestamped_segment_t;
