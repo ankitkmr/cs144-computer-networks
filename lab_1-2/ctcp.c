@@ -149,15 +149,6 @@ void ctcp_destroy(ctcp_state_t *state) {
 }
 
 
-/* Helper Function to copy n chars from from[] to to[] */
-void array_copy(char *to, char *from, int n){
-	int i;
-	for(i=0;i<n;i++){
-		to[i]=from[i];
-	}
-}
-
-
 /* Helper Function to create a new segment. Returns a pointer to the new segment */
 ctcp_segment_t *create_new_segment(ctcp_state_t *state, int bytes_read, char *buffer){
 
@@ -180,7 +171,7 @@ ctcp_segment_t *create_new_segment(ctcp_state_t *state, int bytes_read, char *bu
 		segment will only be equal to the number of bytes we have read 
 		and hence have to send */		
 		char *data = malloc(bytes_read);
-		array_copy(data, buffer, bytes_read);
+		memcpy(data, buffer, bytes_read);
 
 		state->next_seq_no += bytes_read;
 		new_segment->len = htons(sizeof(ctcp_segment_t)+bytes_read);
