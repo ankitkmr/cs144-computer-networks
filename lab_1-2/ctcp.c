@@ -128,7 +128,7 @@ struct ctcp_state {
  * Linked list of connection states. Go through this in ctcp_timer() to
  * resubmit segments and tear down connections.
  */
-static ctcp_state_t *state_list;
+static ctcp_state_t *state_list = NULL;
 
 
 /* We'll use this structure to encapsulate the segment to send 
@@ -206,24 +206,25 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
 	state->recv_buffer = malloc(MAX_SEG_DATA_SIZE);
 
 	/* Initialise corresponding mutex locks and condition variables */
-	pthread_mutex_init(&(state->output_state_mutex), NULL);
-	pthread_mutex_init(&(state->intput_state_mutex), NULL);
-	pthread_mutex_init(&(state->inflight_state_mutex), NULL);
+	pthread_mutex_init(&state->output_state_mutex, NULL);
+	pthread_mutex_init(&state->intput_state_mutex, NULL);
+	pthread_mutex_init(&state->inflight_state_mutex, NULL);
 
-	pthread_cond_init(&(state->new_inflight_segments_cv), NULL);
-	pthread_cond_init(&(state->new_outbound_segments_cv), NULL);
+	pthread_cond_init(&state->new_inflight_segments_cv, NULL);
+	pthread_cond_init(&state->new_outbound_segments_cv, NULL);
 
 
-	state->keep_output_thread_running = NO;
-	while(!(state->keep_output_thread_running)){
+	short thread_creation_success = NO;
+	while(!thread_creation_success){
 	/**
 	 * initialise the output thread and pass the state we just initialized 
 	 * as argument for its procedure call, pthread_create returns 0 on success, 
 	 * +ve otherwise 
 	 */
-		state->keep_output_thread_running = !pthread_create(&(state->output_thread), 
+		 thread_creation_success = !pthread_create(&state->output_thread, 
 			                                 NULL, send_outbound_tail_segments, state);
 	}
+	state->keep_output_thread_running = YES;
 
 	/* now add the state to the state_list*/
 	if(state_list == NULL){
@@ -254,13 +255,13 @@ void ctcp_destroy(ctcp_state_t *state) {
  * segments list. Waits on new_outbound_segments_cv if outbound_segments_list is empty
  */
 timestamped_segment_t *get_next_transmission_segment(ctcp_state_t *state){
-	pthread_mutex_lock(&(state->output_state_mutex));
+	pthread_mutex_lock(&state->output_state_mutex);
 
 	timestamped_segment_t *tail_timestamped_segment;
 	while(state->output_state->outbound_segments_list->head == NULL){
 		/* while there is no data to send i.e. no outbound segment, 
 		   wait on new_outbound_segments_cv */
-		pthread_cond_wait(&new_outbound_segments_cv, &(state->output_state_mutex));
+		pthread_cond_wait(&new_outbound_segments_cv, &state->output_state_mutex);
 	}
 
 	/* now outbound_segments_list is not empty */
@@ -269,33 +270,19 @@ timestamped_segment_t *get_next_transmission_segment(ctcp_state_t *state){
 	ll_remove(state->output_state->outbound_segments_list, 
 			state->output_state->outbound_segments_list->tail);
 		
-	pthread_mutex_unlock(&(state->outbound_list_lock));
+	pthread_mutex_unlock(&state->output_state_mutex);
 	return tail_timestamped_segment;
 }
 
 
-/**
- * Helper function to send a segment while maintaining transmission window size. It 
- * checks if we can include a new segment into inflight list and if we have no space 
- * to send more bytes, we wait on new_inflight segments_cv
- */
-void maintain_transmission_window(ctcp_state_t *state, timestamped_segment_t *timestamped_segment){
-	pthread_mutex_lock(&(state->inflight_list_lock));
 
+/**
+ * Helper function to transmit segment and update segment timestamps. This procedure 
+ * is called while holding inflight_state_mutex
+ */
+void transmit_segment(ctcp_state_t *state, timestamped_segment_t *timestamped_segment){
 	short segment_sent_status;
 	uint16_t segment_len = ntohs(timestamped_segment->segment->len);
-	uint16_t segment_payload_len = segment_len - sizeof(ctcp_segment_t);
-
-	while(state->config->send_window < 
-				state->inflight_state->bytes_inflight + segment_payload_len){
-		/* We cant send another packet so wait on condition variable until 
-		   we can and get signalled so */
-		pthread_cond_wait(&new_inflight_segments_cv, &(state->inflight_state_mutex));
-	}
-
-	/* now window size allows us to add the next segment to transmit to 
-	   inflight_segments_list and send it so we timestamp the segment before 
-	   sending it */
 
 	segment_sent_status = NO;
 	while(!segment_sent_status){
@@ -307,10 +294,38 @@ void maintain_transmission_window(ctcp_state_t *state, timestamped_segment_t *ti
 	}
 
 	/* segment successfully sent */
-	timestamped_segment->transmission_count = 1u;		
-	ll_add(inflight_segments_list, timestamped_segment);
+	timestamped_segment->transmission_count += 1;
+	return;
+}
 
-	pthread_mutex_unlock(&(state->inflight_list_lock));
+
+
+/**
+ * Helper function to send a segment while maintaining transmission window size. It 
+ * checks if we can include a new segment into inflight list and if we have no space 
+ * to send more bytes, we wait on new_inflight segments_cv
+ */
+void maintain_transmission_window(ctcp_state_t *state, timestamped_segment_t *timestamped_segment){
+	pthread_mutex_lock(&state->inflight_state_mutex);
+
+	uint16_t segment_len = ntohs(timestamped_segment->segment->len);
+	uint16_t segment_payload_len = segment_len - sizeof(ctcp_segment_t);
+
+	while(state->config->send_window < 
+				state->inflight_state->bytes_inflight + segment_payload_len){
+		/* We cant send another packet so wait on condition variable until 
+		   we can and get signalled so */
+		pthread_cond_wait(&new_inflight_segments_cv, &state->inflight_state_mutex);
+	}
+
+	/* now window size allows us to add the next segment to transmit to 
+	   inflight_segments_list and send it */
+
+	/* actually send the segment, calls conn_send() */
+	transmit_segment(state, timestamped_segment);
+
+	ll_add_front(state->inflight_state->inflight_segments_list, timestamped_segment);
+	pthread_mutex_unlock(&state->inflight_state_mutex);
 	return;
 }
 
@@ -330,7 +345,6 @@ void send_outbound_tail_segments(void *ctcp_state){
 
 	/* we set this to NO in ctcp_destroy, just before killing this thread */
 	while(state->keep_output_thread_running == YES){
-
 		timestamped_segment = get_next_transmission_segment(state);
 		/* now we have our next segment we want to send, so we check if we can 
 		   window size allows us to add it to inflight_segments_list and send it */
@@ -425,13 +439,13 @@ void ctcp_read(ctcp_state_t *state) {
 	while ((bytes_read = conn_input(state->conn, state->output_buffer, 
 							MAX_SEG_DATA_SIZE)) != 0 && !(state->fin_sent)){
 		/* we acquire and release mutex in loop to separate conn_input() IO-latency. */
-		pthread_mutex_lock(&(state->output_state_mutex));
+		pthread_mutex_lock(&state->output_state_mutex);
 
 		new_segment = create_new_segment(state, bytes_read);
 		add_segment_to_outbound_list(state, new_segment);
-		pthread_cond_signal(&(state->new_outbound_segments_cv));
+		pthread_cond_signal(&state->new_outbound_segments_cv);
 
-		pthread_mutex_unlock(&(state->output_state_mutex));
+		pthread_mutex_unlock(&state->output_state_mutex);
 	}
 	return;
 }
@@ -446,6 +460,56 @@ void ctcp_output(ctcp_state_t *state) {
   /* FIXME */
 }
 
-void ctcp_timer() {
-  /* FIXME */
+
+/**
+ * Helper function to inspect inflight segments of given state for retransmissions
+ * or an unresponseive connection in which case is tears down the connection by calling
+ * ctcp_destroy()
+ */
+void inspect_state_for_retransmissions(ctcp_state_t *state){
+	pthread_mutex_lock(&state->inflight_state_mutex);
+
+	timestamped_segment_t *timestamped_segment;
+
+	int rt_timeout = state->config->rt_timeout;
+	linked_list_t *inflight_segments_list = state->inflight_state->inflight_segments_list;
+	ll_node_t *inflight_transmission_node = inflight_segments_list->head;
+
+	while(inflight_transmission_node != NULL){
+		timestamped_segment = (timestamped_segment_t *)inflight_transmission_node->object;
+		if (current_time() - timestamped_segment->time_when_sent > rt_timeout){
+			if(timestamped_segment->transmission_count < 6){
+				transmit_segment(state, timestamped_segment);
+			}
+			else{
+				/* unresponsive connection so teardown connection */
+				ctcp_destroy(state);
+			}
+		}
+		inflight_transmission_node = inflight_transmission_node->next;
+	}
+
+	pthread_mutex_unlock(&state->inflight_state_mutex);
+	return;
 }
+
+
+
+void ctcp_timer() {
+	ll_node_t *state_node;
+	ctcp_state_t *state;
+
+	if (state_list != NULL){
+		state_node = state_list->head;
+
+		while (state_node != NULL){
+			state = (ctcp_state_t *)state_node->object;
+			inspect_state_for_retransmissions(state);
+			state_node = state_node->next;
+		}
+	}
+	return;
+}
+
+
+
