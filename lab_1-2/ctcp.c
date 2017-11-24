@@ -311,10 +311,19 @@ void maintain_transmission_window(ctcp_state_t *state, timestamped_segment_t *ti
 	uint16_t segment_len = ntohs(timestamped_segment->segment->len);
 	uint16_t segment_payload_len = segment_len - sizeof(ctcp_segment_t);
 
-	while(state->config->send_window < 
-				state->inflight_state->bytes_inflight + segment_payload_len){
-		/* We cant send another packet so wait on condition variable until 
-		   we can and get signalled so */
+	/**
+	 * For Lab 2:
+	 * 		while(state->config->send_window < 
+	 *				state->inflight_state->bytes_inflight + segment_payload_len){
+	 */
+	while(segment_payload_len!=0 && bytes_inflight!=0){
+		/** 
+		 * If it's a data segment and we already have a data segment in-flight then
+		 * we can't send another packet and so we wait on condition variable until 
+		 * we can and get signalled so. 
+		 * 
+		 * For segments with no data, we can transmit them irrespective of window size
+		 */
 		pthread_cond_wait(&new_inflight_segments_cv, &state->inflight_state_mutex);
 	}
 
@@ -324,7 +333,12 @@ void maintain_transmission_window(ctcp_state_t *state, timestamped_segment_t *ti
 	/* actually send the segment, calls conn_send() */
 	transmit_segment(state, timestamped_segment);
 
-	ll_add_front(state->inflight_state->inflight_segments_list, timestamped_segment);
+	if(segment_payload_len){
+		/* only if it's a data segment do we add it to inflight_segments_list to 
+		   monitor when we receive an ACK for it later and handle retransmissions */
+		state->inflight_state->bytes_read += segment_payload_len;
+		ll_add_front(state->inflight_state->inflight_segments_list, timestamped_segment);
+	}
 	pthread_mutex_unlock(&state->inflight_state_mutex);
 	return;
 }
@@ -453,7 +467,11 @@ void ctcp_read(ctcp_state_t *state) {
 
 
 void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
-  /* FIXME */
+	pthread_mutex_lock(&state->recv_state_mutex);
+
+
+	pthread_mutex_unlock(&state->recv_state_mutex);
+	return;
 }
 
 void ctcp_output(ctcp_state_t *state) {
