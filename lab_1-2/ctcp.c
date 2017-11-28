@@ -65,8 +65,8 @@ typedef struct {
 
 /* struct to hold input state fields of ctcp connection */
 typedef struct {
-	long last_ack_received;
-	ll_node_t *last_possible_output_node;
+	long last_ackno_received;
+	ll_node_t *last_eligible_output_node;
 	linked_list_t *inbound_segments_list;	/* Linked list of segments received from 
 	                                           other endpoint*/
 } ctcp_inbound_state_t;
@@ -108,7 +108,6 @@ struct ctcp_state {
 
 	/* used by only one thread at a time, read into this in ctcp_read */
 	char *output_buffer;		
-	char *recv_buffer;
 
 	/* output, input and inflight state to be shared by threads */
 	ctcp_outbound_state_t *outbound_state;		
@@ -125,14 +124,13 @@ struct ctcp_state {
 	pthread_cond_t new_inflight_segments_cv;
 
 	pthread_t transmission_thread;		/* forked thread for handling transmissions */
-	int keep_transmission_thread_running;	/* we set this to NO to exit infinite loop of 
-	                                   transmission_thread procedure before killing that
-	                                   thread */
+
 	short fin_sent;	
 	short fin_received;
+	short fin_acked;
 
-	pthread_mutex_t ackno_mutex;
-	long _next_ackno;	/* last ack sent by our end. Only access this field via
+	pthread_mutex_t ackno_sent_mutex;
+	long _last_ackno_sent;	/* last ack sent by our end. Only access this field via
                                getter and setter methods defined below */
 };
 
@@ -145,18 +143,18 @@ static ctcp_state_t *state_list = NULL;
 
 
 /* Getter function to get the value of _next_ackno field of given state */
-long get_next_ackno(ctcp_state_t *state){
-	pthread_mutex_lock(&state->ackno_mutex);
-	long next_ackno = state->_next_ackno;
-	pthread_mutex_unlock(&state->ackno_mutex);
-	return next_ackno;
+long get_last_ackno_sent(ctcp_state_t *state){
+	pthread_mutex_lock(&state->ackno_sent_mutex);
+	long last_ackno_sent = state->_last_ackno_sent;
+	pthread_mutex_unlock(&state->ackno_sent_mutex);
+	return last_ackno_sent;
 }
 
 /* Setter function to update the value of _next_ackno field of given state */
-void set_next_ackno(ctcp_state_t *state, long next_ack_to_send){
-	pthread_mutex_lock(&state->ackno_mutex);
-	state->_next_ackno = next_ack_to_send;
-	pthread_mutex_unlock(&state->ackno_mutex);
+void set_last_ackno_sent(ctcp_state_t *state, long next_ack_to_send){
+	pthread_mutex_lock(&state->ackno_sent_mutex);
+	state->_last_ackno_sent = next_ack_to_send;
+	pthread_mutex_unlock(&state->ackno_sent_mutex);
 	return;
 }
 
@@ -173,8 +171,8 @@ ctcp_outbound_state_t *outbound_state_init(){
 /* Helper function to allocate memory for input state variable and initialise input state fields */
 ctcp_inbound_state_t *inbound_state_init(){
 	ctcp_inbound_state_t *inbound_state = malloc(sizeof(ctcp_inbound_state_t));
-	inbound_state->last_ack_received = 0u;
-	inbound_state->last_possible_output_node = NULL;
+	inbound_state->last_ackno_received = INITIAL_ACK_NUMBER;
+	inbound_state->last_eligible_output_node = NULL;
 	inbound_state->inbound_segments_list = ll_create();
 	return inbound_state;
 }
@@ -210,6 +208,7 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
 	state->config = cfg;
 	state->fin_sent = NO;
 	state->fin_received = NO;	/* if fin received it stores it's seqno */
+	state->fin_acked = NO;
 
 	/*
 	  Our main buffer into which we read in data to send or copy in data received
@@ -239,8 +238,6 @@ ctcp_state_t *ctcp_init(conn_t *conn, ctcp_config_t *cfg) {
 	state->_next_ackno = INITIAL_ACK_NUMBER;
 
 	short thread_creation_success = NO;
-	state->keep_transmission_thread_running = YES;
-
 	while(!thread_creation_success){
 	/**
 	 * initialise the transmission thread and pass the state we just initialized 
@@ -381,8 +378,7 @@ void send_outbound_tail_segments(void *ctcp_state){
 	ctcp_state_t *state = ctcp_state;
 	timestamped_segment_t *timestamped_segment;
 
-	/* we set this to NO in ctcp_destroy, just before killing this thread */
-	while(state->keep_transmission_thread_running == YES){
+	while(YES){
 		timestamped_segment = get_next_transmission_segment(state);
 		/* now we have our next segment we want to send, so we check if our 
 		   window size allows us to add it to inflight_segments_list and send it */
@@ -409,7 +405,7 @@ ctcp_segment_t *create_new_segment(ctcp_state_t *state, int bytes_read){
 	
 	  This allows us to send ACK immediately in response to a data segment
 	 */
-	new_segment->ackno = htonl(get_next_ackno(state));
+	new_segment->ackno = htonl(get_last_ackno_sent(state));
 
 	new_segment->flags |= htonl(ACK);
 	new_segment->window = htons(state->config->recv_window); 	
@@ -540,7 +536,7 @@ void free_transmission_node(ctcp_state_t *state, ll_node_t *transmission_node){
 void update_inflight_state(ctcp_state_t *state){
 	pthread_mutex_lock(&state->inflight_state_mutex);
 
-	long last_ack_received = state->inbound_state->last_ack_received;
+	long last_ackno_received = state->inbound_state->last_ackno_received;
 	ll_node_t *inflight_transmission_node = state->inflight_state->inflight_segments_list->tail;
 
 	/* inflight list is ordered in the decreasing sequence no. order going left-right*/
@@ -551,10 +547,10 @@ void update_inflight_state(ctcp_state_t *state){
 		short segment_data_len = ntohs(timestamped_segment->segment->len) - sizeof(ctcp_segment_t);
 		long total_bytes_sent = segment_seqno + segment_data_len - 1;
 
-		/* despite having already updated last_ack_received we only remove a segment 
+		/* despite having already updated last_ackno_received we only remove a segment 
 		   from inflight_list after we're sure all of it has been received else 
 		   we'll let the timer retransmit it */
-		if (total_bytes_sent < last_ack_received){
+		if (total_bytes_sent < last_ackno_received){
 			/* this segment has been received by the other end, remove it from 
 			   list and free it*/
 			inflight_transmission_node = inflight_transmission_node->prev;
@@ -579,163 +575,162 @@ void update_inflight_state(ctcp_state_t *state){
 
 /**
  * Helper Function to process ACK bit and/or FIN bits in segments and corresponding 
- * actions. Called while holding inbound_state_mutex
+ * actions.
  */
-void process_ctcp_flags(ctcp_state_t *state, ctcp_segment_t *segment){
+short process_ctcp_flags(ctcp_state_t *state, ctcp_segment_t *segment){
+	pthread_mutex_lock(&state->inbound_state_mutex);
+
 	uint32_t segment_ackno;
 	uint32_t segment_seqno;
 	uint32_t segment_flags = ntohl(segment->flags);
+	short can_we_free_segment = YES;
 
 	if (segment_flags & ACK){	/* ACK bit set */
 		segment_ackno = ntohl(segment->ackno);
 
 		/**
 		 * since it's possible that an ack might get delayed so we only update the 
-		 * last_ack_received if ack received advances it. 
+		 * last_ackno_received if ack received advances it. 
 		 *
 		 * Then update the inflight_state for segments still in-flight accordingly 
 		 */
-		if(state->inbound_state->last_ack_received < segment_ackno){
-			state->inbound_state->last_ack_received = segment_ackno;
+		if(state->inbound_state->last_ackno_received < segment_ackno){
+			state->inbound_state->last_ackno_received = segment_ackno;
 			update_inflight_state(state);
 		}
 	}
 
 	if (segment_flags & FIN){ /* FIN bit set*/
 		/**
-		 * since fin segment has no data it wouldn't be processed in ctcp_read()
-		 * later so we add it here. We'll output EOF when we receive all segments.
-		 * Untill then the fin segment stays in inbound list. We do send an ACK 
-		 * right away in this case
+		 * We'll treat fin segments like data segments and output EOF after we receive 
+		 * all data segments. But since it doesnt have data it wont be processed by 
+		 * ctcp_receive(). So we add it to inbound_segments_list here
  		 *
 		 * We'll let the timer or some other function see if all
 		 * conditions are met and its time to teardown the connection 
 		 */
 		segment_seqno = ntohl(segment->seqno);
-		long next_ack_to_send = get_next_ackno(state);
+		long last_ackno_sent = get_last_ackno_sent(state);
 
 		if (!state->fin_received){
 			state->fin_received = segment_seqno;
-			ll_add(state->inbound_state->inbound_segments_list, segment);
-		}
 
-		if (next_ack_to_send == segment_seqno){
-			/* we have received all data there was */
-			set_next_ackno(state, next_ack_to_send + 1);
+			if (last_ackno_sent == segment_seqno){
+				/* we have received and acked all data there was so we expect 
+				no more data so right away print out EOF, send ack to this fin 
+				and update last_ackno_sent */
+				conn_output(state->conn, NULL, 0);
+				send_response_ack(state, last_ackno_sent + 1);
+				state->fin_acked = YES;
+			} 
+			else {
+				/* we add it in inboud segments list to be handled by update_inbound_state
+				   after we receive all the data segments. Also now we cant free the
+				   segment right away */
+				ll_add(state->inbound_state->inbound_segments_list, segment);
+				can_we_free_segment = NO;
+			}
 		}
-		/* else after we receive the last data segment we'll update and send the 
-		   new ack */
-		send_response_ack(state);
 	}
-
-	return;
+	pthread_mutex_unlock(&state->inbound_state_mutex);
+	return can_we_free_segment;
 }
 
 
+
 /**
- * Helper function to update the inbound state upon receiving a data segment. This
- * function is called while holding the inbound_state_mutex. Returns the updated next_ackno
+ * Helper function to insert segment into inbound_segments_list. This
+ * function acquires the inbound_state_mutex. This function is caled 
+ * only when we are sure that the segment is to be kept. 
+ *
+ * It inserts the segment if its a new segment and returns NO for 
+ * duplicacy, else in case of a duplicate segment it returns YES and 
+ * doesn't insert the segment
  */
-long update_inbound_state(ctcp_state_t *state, ctcp_segment_t *segment){
+short insert_segment_to_inbound_list(ctcp_state_t *state, ctcp_segment_t *segment){
+	pthread_mutex_lock(&state->inbound_state_mutex);
 
 	ctcp_segment_t *node_segment;
-	long node_segment_seqno;	
+	long node_segment_seqno;
 	
+	short is_segment_duplicate = YES;	/* set by default*/
 	long segment_seqno = ntohl(segment->seqno);
-	short segment_data_len = ntohs(segment->len) - sizeof(ctcp_segment_t);
-	long next_ackno = get_next_ackno(state);
 
 	linked_list_t *inbound_segments_list = state->inbound_state->inbound_segments_list;
 	ll_node_t *inbound_node = inbound_segments_list->tail;
+	ll_node_t *last_eligible_output_node = state->inbound_state->last_eligible_output_node;
 
-	short is_segment_duplicate = YES;	
+	if (inbound_node == NULL){ 
+		/* inbound_segments_list is empty */
+		ll_add(inbound_segments_list, segment);
+		is_segment_duplicate = NO;
+	} 
+	else{
+		/*
+		  if inbound segments list is not empty then we have to inspect against
+		  segments in the list until we find the right position to insert the
+		  received segment. We keep the received segments in the order of increasing
+		  sequence numbers left to right. We start with inbound node at tail of list 
+		 */
+		while (inbound_node != NULL && inbound_node != last_eligible_output_node){
+			node_segment = inbound_node->object;
+			node_segment_seqno = ntohl(node_segment->seqno);
 
-	if (segment_seqno >= next_ackno){
-		/* the received segment is to be kept as we havent received bytes 
-		   upto it completely */
-		if (inbound_node == NULL){ 
-			/* inbound_segments_list is empty */
-			ll_add(inbound_segments_list, segment);
-			is_segment_duplicate = NO;
-		}
-		else{
-			/*
-			  if inbound segments list is not empty then we have to inspect against
-			  segments in the list until we find the right position to insert
-			  the received segment. We keep the received segments in the order of 
-			  increasing sequence numbers. 
-			 */
-			while (inbound_node != NULL){
-				node_segment = inbound_node->object;
-				node_segment_seqno = ntohl(node_segment->seqno);
-
-				if (node_segment_seqno == segment_seqno){
-					break; /* it's a duplicate */
-				}
-				else if (node_segment_seqno < segment_seqno ){
-					/* if we're here then all the segments to right of current node are 
-					   of larger sequence numbers */
-					ll_add_after(inbound_segments_list, inbound_node, segment);
-					is_segment_duplicate = NO;
-					break;
-				}
-				else{
-					inbound_node = inbound_node->prev;
-				}
+			if (node_segment_seqno == segment_seqno){
+				break; /* it's a duplicate */
 			}
-
-			if(inbound_node == NULL){
-				/*in case a segment comes after delay but is to be kept
-				  and has less seqno than all others in the list*/
-				ll_add_front(inbound_segments_list, segment);
+			else if (node_segment_seqno < segment_seqno ){
+				/* if we're here then all the segments to right of current node are 
+				   of larger sequence numbers */
+				ll_add_after(inbound_segments_list, inbound_node, segment);
 				is_segment_duplicate = NO;
-			}
-		}
-
-		/*by now, if it wasnt a duplicate, we've placed the segment, so check if
-		  we can advance ack_no and print out accordingly */
-		if(!is_segment_duplicate){ 
-			short node_segment_data_len;
-
-			if (state->inbound_state->last_possible_output_node == NULL){
-				/*means all node in the inbound_segments_list that could be outputted 
-				  have been outputted so start at the front of list*/
-				inbound_node = inbound_segments_list->head;
+				break;	/* sucessfully inserted */
 			}
 			else{
-				inbound_node = state->inbound_state->last_possible_output_node->next;
-			}
-
-			while(inbound_node!=NULL){
-				node_segment = inbound_node->object;
-				node_segment_seqno = ntohl(node_segment->seqno);
-				node_segment_data_len = ntohs(node_segment->len) - sizeof(ctcp_segment_t);
-
-				if(node_segment_seqno == next_ackno){
-					next_ackno += node_segment_data_len;
-					state->inbound_state->last_possible_output_node = inbound_node;
-					inbound_node = inbound_node->next;
-				}
-				else{
-					/*else our next in sequence segment is missing */
-					break;
-				}
-			}
-
-			if(ntohl(node_segment->flags) & FIN){
-				next_ackno+=1;
-			}
-
-			if (get_next_ackno(state) != next_ackno){
-				/*advance the next ackno in the state and output the segments till
-				 last possible output node (inclusive)*/
-				ctcp_output(state);
+				inbound_node = inbound_node->prev;
 			}
 		}
+
+		if(inbound_node == NULL){
+			/*in case a segment comes after delay but is to be kept
+			  and has less seqno than all others in the list*/
+			ll_add_front(inbound_segments_list, segment);
+			is_segment_duplicate = NO;
+		}
 	}
-	
-	/* Else it's a duplicate and we dont need it but we still send an ack for it later*/
-	return next_ackno;
+	pthread_mutex_unlock(&state->inbound_state_mutex);
+	return is_segment_duplicate;
+}
+
+
+
+/**
+ * Helper function to update the inbound state upon receiving a data segment.  
+ */
+void update_inbound_state(ctcp_state_t *state, ctcp_segment_t *segment){
+	short is_segment_duplicate = YES;
+	long segment_seqno = ntohl(segment->seqno);
+	long next_seqno_expected = get_last_ackno_sent(state);
+
+	/* the received segment is to be kept as we havent received bytes upto it 
+	   completely. For these segments the response ack will be sent by ctcp_output() 
+	   after its data has been printed out */
+	if (segment_seqno >= next_seqno_expected){
+		is_segment_duplicate = insert_segment_to_inbound_list(state, segment);
+
+		/*by now, if the segment wasnt a duplicate, we've placed the segment, so 
+		  call ctcp_output to check if as a result of its insertion we can print 
+		  more data out and update last_ackno_sent accordingly */
+		if(!is_segment_duplicate){ 
+			ctcp_output(state);
+		}
+	}
+	else{
+		/* Else it's a duplicate and we dont need it. We have already acked it but 
+		   may be that ACK got lost so need to send an ack for it again */
+		send_response_ack(state, next_seqno_expected);
+	}
+	return;
 }
 
 
@@ -751,46 +746,93 @@ int check_segment_integrity(ctcp_state_t *state, ctcp_segment_t *segment, size_t
 }
 
 
-void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
-	pthread_mutex_lock(&state->inbound_state_mutex);
-	long next_ackno;
-	/* first thing you do is check segment for integrity */
-	if (check_segment_integrity(state, segment, len)){ 
 
-		/* if segment is acceptable, process it's ctcp flags if any */
-		process_ctcp_flags(state, segment);
+/** 
+ * First check segments integrity. If the segment has been truncated or corrupted, 
+ * we ignore the segment and free it. 
+ * 
+ * If a segment is acceptable then process its ctcp_flags if any. Also check in case its 
+ * a fin segment if can we free it. Rest all segments unless they have data can be freed 
+ * right away
+ *
+ * If a segment with data is received, then check if it's a new segment, place it
+ * in sequence number order i.e. update inbound state accordingly. 
+ *
+ * If data is ready to be outputted, output it by calling ctcp_output() 
+ * and do flow control by timing sending an ACK with the updated inbound 
+ * state if no buffer space left in conn_bufspace()
+ *
+ * For data segments we free them after they have been outputted in ctcp_output()
+ */
+void ctcp_receive(ctcp_state_t *state, ctcp_segment_t *segment, size_t len) {
+	short can_we_free_segment = YES;
+	
+	if (check_segment_integrity(state, segment, len)){ 	
+		can_we_free_segment = process_ctcp_flags(state, segment);	
 
 		if(segment->data != NULL){
-			/**
-			 * segment with data received, so check if it's a new segment, place it
-			 * in sequence number order and update inbound state accordingly. 
-			 *
-			 * If data is ready to be outputted, output it by calling ctcp_output() 
-			 * and do flow control by timing sending an ACK with the updated inbound 
-			 * state if no buffer space left in conn_bufspace()
-			 */
-			next_ackno = update_inbound_state(state, segment);
-			send_response_ack(state, next_ackno);
+			update_inbound_state(state, segment);
+			can_we_free_segment = NO;
 		}
 	}
 
-	/** 
-	 * For segments we receive:
-	 * 		If the segment has been truncated or corrupted, we ignore the segment  
-	 *		If the segment has no data then we only process its flags as above. 
-	 * 
-	 *		In all cases, after we're done with the segment, we free the memory 
-	 *		allocated for it
-	 */
-	free_ctcp_segment(segment);
-	pthread_mutex_lock(&state->inbound_state_mutex);
+	if(can_we_free_segment){
+		free_ctcp_segment(segment);
+	}
 	return;
 }
 
 
 
+/**
+ * This is the only function that updates the last_ackno_sent in inbound state. This 
+ * function acquires the inbound state mutex 
+ */
 void ctcp_output(ctcp_state_t *state) {
-  /* FIXME */
+	pthread_mutex_lock(&state->inbound_state_mutex);
+
+	ctcp_segment_t *node_segment;
+	long node_segment_seqno;
+	short node_segment_data_len;
+	short output_result;
+
+	linked_list_t *inbound_segments_list = state->inbound_state->inbound_segments_list;	
+	ll_node_t *inbound_node = inbound_segments_list->head;
+	long next_seqno_expected = get_last_ackno_sent(state);				
+
+	while (inbound_node){
+		node_segment = inbound_node->object;
+		node_segment_seqno = ntohl(node_segment->seqno);
+		node_segment_data_len = ntohs(node_segment->len) - sizeof(ctcp_segment_t);
+
+		if(node_segment_seqno == next_seqno_expected){
+			/* means this node can be printed */
+			if (conn_bufspace(state->conn) >= node_segment_data_len){
+				output_result = conn_output(state->conn, 
+					                 node_segment->data, node_segment_data_len);
+
+				if(output_result == -1){
+					ctcp_destroy(state);
+				}
+				else{
+					next_seqno_expected += node_segment_data_len;
+					send_response_ack(state, next_seqno_expected);
+					set_last_ackno_sent(state, next_seqno_expected);
+				}
+			}
+			else{
+				/* We cant output so simply break without updating last_seqno_outputted */
+				break;
+			}
+		}
+		else{
+			/* this segment is not in order yet */
+			break;
+		}
+		inbound_node = inbound_node->next;
+	}
+	pthread_mutex_unlock(&state->inbound_state_mutex);
+	return;
 }
 
 
@@ -835,7 +877,6 @@ void inspect_state_for_retransmissions(ctcp_state_t *state){
 }
 
 
-
 void ctcp_timer() {
 	ll_node_t *state_node;
 	ctcp_state_t *state;
@@ -851,6 +892,4 @@ void ctcp_timer() {
 	}
 	return;
 }
-
-
 
