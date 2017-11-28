@@ -573,6 +573,22 @@ void update_inflight_state(ctcp_state_t *state){
 }
 
 
+/* Helper function to send an ack in a response to data segment or fin segment received */
+void send_response_ack(ctcp_state_t *state, long next_ack_to_send){
+	ctcp_segment_t *new_segment = create_new_segment(state, 0);
+	new_segment->ackno = next_ack_to_send;
+	
+	timestamped_segment_t *timestamped_segment = calloc(sizeof(timestamped_segment_t),1);
+	timestamped_segment->transmission_count = 0u;
+	timestamped_segment->segment = new_segment;
+
+	transmit_segment(state, timestamped_segment);
+	free_timestamped_segment(timestamped_segment);
+	return;
+}
+
+
+
 /**
  * Helper Function to process ACK bit and/or FIN bits in segments and corresponding 
  * actions.
