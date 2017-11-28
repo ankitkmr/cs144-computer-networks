@@ -795,12 +795,12 @@ void ctcp_output(ctcp_state_t *state) {
 	long node_segment_seqno;
 	short node_segment_data_len;
 	short output_result;
+	ll_node_t *inbound_node;
 
 	linked_list_t *inbound_segments_list = state->inbound_state->inbound_segments_list;	
-	ll_node_t *inbound_node = inbound_segments_list->head;
 	long next_seqno_expected = get_last_ackno_sent(state);				
 
-	while (inbound_node){
+	while (inbound_node = inbound_segments_list->head){
 		node_segment = inbound_node->object;
 		node_segment_seqno = ntohl(node_segment->seqno);
 		node_segment_data_len = ntohs(node_segment->len) - sizeof(ctcp_segment_t);
@@ -815,9 +815,15 @@ void ctcp_output(ctcp_state_t *state) {
 					ctcp_destroy(state);
 				}
 				else{
+					/*successfully printed so update ackno and send a response
+					for this segment with the new ackno and then free the segment 
+					and free the node */
 					next_seqno_expected += node_segment_data_len;
 					send_response_ack(state, next_seqno_expected);
 					set_last_ackno_sent(state, next_seqno_expected);
+					
+					free_ctcp_segment(node_segment);
+					ll_remove(inbound_segments_list, inbound_node);
 				}
 			}
 			else{
@@ -829,7 +835,6 @@ void ctcp_output(ctcp_state_t *state) {
 			/* this segment is not in order yet */
 			break;
 		}
-		inbound_node = inbound_node->next;
 	}
 	pthread_mutex_unlock(&state->inbound_state_mutex);
 	return;
