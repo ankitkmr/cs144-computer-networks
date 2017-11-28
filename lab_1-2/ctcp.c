@@ -730,6 +730,10 @@ void update_inbound_state(ctcp_state_t *state, ctcp_segment_t *segment){
 		   may be that ACK got lost so need to send an ack for it again */
 		send_response_ack(state, next_seqno_expected);
 	}
+
+	if(is_segment_duplicate){
+		free_ctcp_segment(segment);
+	}
 	return;
 }
 
@@ -821,7 +825,7 @@ void ctcp_output(ctcp_state_t *state) {
 					next_seqno_expected += node_segment_data_len;
 					send_response_ack(state, next_seqno_expected);
 					set_last_ackno_sent(state, next_seqno_expected);
-					
+
 					free_ctcp_segment(node_segment);
 					ll_remove(inbound_segments_list, inbound_node);
 				}
